@@ -1,0 +1,1144 @@
+import math
+import argparse
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import re
+
+
+def parse_constraint(constraint_str):
+    """
+    Parse a constraint string in the format 'expression => value' or 'expression >= value'.
+    Returns the constraint function as g(x) >= 0.
+    
+    Examples:
+    - "x1 + x2 => 1" -> g(x) = x1 + x2 - 1
+    - "x1**2 + x2**2 => 1" -> g(x) = x1**2 + x2**2 - 1
+    - "x1 + x2 => 1 and x1 - x2 => 0.5" -> combined constraints
+    """
+    # Check if there are multiple constraints separated by 'and'
+    if ' and ' in constraint_str.lower():
+        # Split by 'and' (case insensitive)
+        parts = re.split(r'\s+and\s+', constraint_str, flags=re.IGNORECASE)
+        constraints = []
+        displays = []
+        for part in parts:
+            parsed, display = parse_single_constraint(part)
+            constraints.append(parsed)
+            displays.append(display)
+        # Combine constraints using min (g(x) = min(g1(x), g2(x), ...))
+        combined = f"min({', '.join(constraints)})"
+        combined_display = ' and '.join(displays)
+        return combined, combined_display
+    else:
+        return parse_single_constraint(constraint_str)
+
+
+def parse_single_constraint(constraint_str):
+    """
+    Parse a single constraint string in the format 'expression => value' or 'expression >= value'.
+    Returns the constraint function as g(x) >= 0.
+    """
+    clean = constraint_str.replace(' ', '')
+    
+    if '=>' in clean:
+        parts = clean.split('=>')
+        operator = '=>'
+    elif '>=' in clean:
+        parts = clean.split('>=')
+        operator = '>='
+    else:
+        return constraint_str, constraint_str
+    
+    if len(parts) != 2:
+        return constraint_str, constraint_str
+    
+    expr = parts[0]
+    value = parts[1]
+    
+    return f"({expr}) - ({value})", f"{expr} {operator} {value}"
+
+
+def suggest_parameters(func_str, constraint_str, start_values):
+    """
+    Suggest appropriate learning rate and alpha values based on the function structure.
+    These are conservative values that prioritize stability over speed.
+    """
+    clean_func = func_str.replace(' ', '')
+    clean_constraint = constraint_str.replace(' ', '')
+    
+    # Start with conservative defaults
+    suggested_lr = 0.001
+    suggested_alpha = 1.0
+    reason = ""
+    
+    # Check if multiple constraints
+    num_constraints = len(re.findall(r'and', constraint_str.lower())) + 1 if 'and' in constraint_str.lower() else 1
+    if num_constraints > 1:
+        reason = f"Multiple constraints ({num_constraints}). "
+        suggested_alpha = 1.5
+        suggested_lr = 0.0005
+    
+    # Detect objective type
+    if '**4' in clean_func or '**5' in clean_func or '**6' in clean_func:
+        suggested_lr = 0.0001
+        reason += "Objective has degree 4+. Using very small LR (0.0001)."
+    elif '**3' in clean_func:
+        suggested_lr = 0.0005
+        reason += "Objective has cubic term. Using small LR (0.0005)."
+    elif '**2' in clean_func or '^2' in clean_func:
+        if 'x1**2 + x2**2' in clean_func or 'x1^2 + x2^2' in clean_func:
+            suggested_lr = 0.001
+            reason += "Simple quadratic. Using LR=0.001."
+        elif '100*' in clean_func or '50*' in clean_func:
+            suggested_lr = 0.0005
+            reason += "Quadratic with large coefficients. Using LR=0.0005."
+        else:
+            suggested_lr = 0.001
+            reason += "Quadratic objective. Using LR=0.001."
+    elif 'exp(' in clean_func or 'e**' in clean_func:
+        suggested_lr = 0.0001
+        reason += "Exponential objective. Using very small LR (0.0001)."
+    elif 'sin' in clean_func or 'cos' in clean_func or 'tan' in clean_func:
+        suggested_lr = 0.001
+        reason += "Trigonometric objective. Using LR=0.001."
+    else:
+        suggested_lr = 0.001
+        reason += "Default conservative LR=0.001."
+    
+    # Adjust based on constraint complexity
+    if '**4' in clean_constraint or '**5' in clean_constraint or '**6' in clean_constraint:
+        suggested_alpha = max(suggested_alpha, 1.5)
+        suggested_lr = suggested_lr * 0.5
+        reason += " High-degree constraint."
+    elif 'sin' in clean_constraint or 'cos' in clean_constraint:
+        suggested_alpha = max(suggested_alpha, 1.5)
+        suggested_lr = suggested_lr * 0.5
+        reason += " Trigonometric constraint."
+    elif 'exp' in clean_constraint:
+        suggested_alpha = max(suggested_alpha, 2.0)
+        suggested_lr = suggested_lr * 0.3
+        reason += " Exponential constraint."
+    
+    # Special case: Circle constraint with quadratic objective
+    if ('x1**2 + x2**2' in clean_func or 'x1^2 + x2^2' in clean_func) and \
+       ('x1**2 + x2**2' in clean_constraint or 'x1^2 + x2^2' in clean_constraint):
+        suggested_lr = 0.001
+        suggested_alpha = 1.0
+        reason = "Circle constraint with quadratic objective. Using LR=0.001, Alpha=1.0."
+    
+    # Adjust for starting values
+    max_start = max(abs(v) for v in start_values)
+    if max_start > 10:
+        suggested_lr = suggested_lr / (max_start / 5)
+        reason += f" Starting values far from origin ({max_start:.1f}). LR reduced."
+    
+    # Ensure reasonable bounds
+    suggested_lr = min(max(suggested_lr, 0.00001), 0.01)
+    suggested_alpha = min(max(suggested_alpha, 0.1), 2.5)
+    
+    reason += " If oscillation occurs, try: -lr 0.001 -a 1.0"
+    
+    return suggested_lr, suggested_alpha, reason
+
+
+class LossSurface:
+    """A loss surface for 2D functions with safe gradient flow visualization."""
+    
+    def __init__(self, func_str, constraint_str, x1_range=(-3, 3), x2_range=(-3, 3), num_points=200, alpha=0.5):
+        self.func_str = func_str
+        self.constraint_raw = constraint_str
+        self.constraint_parsed, self.constraint_display = parse_constraint(constraint_str)
+        self.constraint_str = self.constraint_parsed
+        self.x1_min, self.x1_max = x1_range
+        self.x2_min, self.x2_max = x2_range
+        self.alpha = alpha
+        
+        x1_list = np.linspace(x1_range[0], x1_range[1], num_points)
+        x2_list = np.linspace(x2_range[0], x2_range[1], num_points)
+        self.X1, self.X2 = np.meshgrid(x1_list, x2_list)
+        
+        self.namespace = {
+            'sin': math.sin, 'cos': math.cos, 'tan': math.tan,
+            'exp': math.exp, 'log': math.log, 'log10': math.log10,
+            'sqrt': math.sqrt, 'pi': math.pi, 'e': math.e,
+            'abs': abs, 'min': min, 'max': max,
+            'x1': 0, 'x2': 0
+        }
+        
+        self.Z = np.zeros_like(self.X1)
+        for i in range(num_points):
+            for j in range(num_points):
+                self.namespace['x1'] = self.X1[i, j]
+                self.namespace['x2'] = self.X2[i, j]
+                try:
+                    val = eval(func_str, {"__builtins__": {}}, self.namespace)
+                    if np.isinf(val) or np.isnan(val) or abs(val) > 1e100:
+                        self.Z[i, j] = np.nan
+                    else:
+                        self.Z[i, j] = val
+                except:
+                    self.Z[i, j] = np.nan
+        
+        self.G = np.zeros_like(self.X1)
+        for i in range(num_points):
+            for j in range(num_points):
+                self.namespace['x1'] = self.X1[i, j]
+                self.namespace['x2'] = self.X2[i, j]
+                try:
+                    val = eval(self.constraint_str, {"__builtins__": {}}, self.namespace)
+                    if np.isinf(val) or np.isnan(val) or abs(val) > 1e100:
+                        self.G[i, j] = np.nan
+                    else:
+                        self.G[i, j] = val
+                except:
+                    self.G[i, j] = np.nan
+    
+    def plot_3d(self, trajectories=None, best_trajectory=None, title=None, alpha_val=None):
+        fig = plt.figure(figsize=(14, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        Z_masked = np.ma.masked_invalid(self.Z)
+        surf = ax.plot_surface(self.X1, self.X2, Z_masked, cmap='viridis', 
+                               alpha=0.7, linewidth=0, antialiased=True)
+        fig.colorbar(surf, ax=ax, shrink=0.5, aspect=5, label='f(x)')
+        
+        ax.contour(self.X1, self.X2, self.G, levels=[0], colors=['red'], 
+                  linewidths=2, alpha=0.8)
+        
+        if trajectories:
+            colors = ['cyan', 'magenta', 'yellow', 'orange', 'purple', 'pink', 'lime', 'white']
+            for idx, trajectory in enumerate(trajectories):
+                traj_x1 = [p[0] for p in trajectory]
+                traj_x2 = [p[1] for p in trajectory]
+                traj_z = [self.evaluate_point(p[0], p[1]) for p in trajectory]
+                
+                valid_indices = [i for i, z in enumerate(traj_z) if np.isfinite(z) and abs(z) < 1e100]
+                if valid_indices:
+                    traj_x1 = [traj_x1[i] for i in valid_indices]
+                    traj_x2 = [traj_x2[i] for i in valid_indices]
+                    traj_z = [traj_z[i] for i in valid_indices]
+                    
+                    color = colors[idx % len(colors)]
+                    alpha = 0.3 if idx > 0 else 0.5
+                    linewidth = 1.0 if idx > 0 else 2.0
+                    
+                    ax.plot(traj_x1, traj_x2, traj_z, '-', color=color, 
+                           linewidth=linewidth, alpha=alpha, label=f'Run {idx+1}')
+                    
+                    ax.scatter(traj_x1[0], traj_x2[0], traj_z[0], 
+                              color=color, s=30, marker='o', alpha=0.5)
+        
+        if best_trajectory:
+            traj_x1 = [p[0] for p in best_trajectory]
+            traj_x2 = [p[1] for p in best_trajectory]
+            traj_z = [self.evaluate_point(p[0], p[1]) for p in best_trajectory]
+            
+            valid_indices = [i for i, z in enumerate(traj_z) if np.isfinite(z) and abs(z) < 1e100]
+            if valid_indices:
+                traj_x1 = [traj_x1[i] for i in valid_indices]
+                traj_x2 = [traj_x2[i] for i in valid_indices]
+                traj_z = [traj_z[i] for i in valid_indices]
+                
+                ax.plot(traj_x1, traj_x2, traj_z, 'gold', linewidth=4, label='BEST Path')
+                ax.scatter(traj_x1[0], traj_x2[0], traj_z[0], 
+                          color='green', s=120, label='Start', edgecolor='black', linewidth=1)
+                ax.scatter(traj_x1[-1], traj_x2[-1], traj_z[-1], 
+                          color='blue', s=120, label='End', edgecolor='black', linewidth=1)
+        
+        ax.set_xlabel('x1', fontsize=12)
+        ax.set_ylabel('x2', fontsize=12)
+        ax.set_zlabel('f(x1, x2)', fontsize=12)
+        
+        Z_finite = self.Z[np.isfinite(self.Z)]
+        if len(Z_finite) > 0:
+            z_min, z_max = np.percentile(Z_finite, [1, 99])
+            if z_min == z_max:
+                z_min, z_max = -10, 10
+            ax.set_zlim(z_min, z_max)
+        
+        if title:
+            display_title = title
+        else:
+            display_title = f'Safe Gradient Flow\nf(x1, x2) = {self.func_str}\n{self.constraint_display}'
+        
+        if alpha_val is not None:
+            display_title += f'\nAlpha = {alpha_val:.4f}'
+        elif self.alpha is not None:
+            display_title += f'\nAlpha = {self.alpha:.4f}'
+        
+        ax.set_title(display_title, fontsize=14)
+        
+        from matplotlib.lines import Line2D
+        
+        legend_elements = [
+            Line2D([0], [0], color='red', linewidth=2, label='Constraint boundary g(x)=0')
+        ]
+        
+        if trajectories and len(trajectories) > 1:
+            colors = ['cyan', 'magenta', 'yellow', 'orange', 'purple', 'pink', 'lime', 'white']
+            for idx in range(min(3, len(trajectories))):
+                color = colors[idx % len(colors)]
+                legend_elements.append(Line2D([0], [0], color=color, linewidth=2, 
+                                             label=f'Run {idx+1}'))
+        
+        if best_trajectory:
+            legend_elements.append(Line2D([0], [0], color='gold', linewidth=4, label='BEST Path'))
+            legend_elements.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='green', 
+                                          markersize=10, label='Start'))
+            legend_elements.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', 
+                                          markersize=10, label='End'))
+        
+        ax.legend(handles=legend_elements, loc='upper right')
+        ax.view_init(elev=25, azim=-60)
+        plt.tight_layout()
+        return fig, ax
+    
+    def plot_contour(self, trajectories=None, best_trajectory=None, title=None, alpha_val=None):
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        Z_masked = np.ma.masked_invalid(self.Z)
+        cp = ax.contour(self.X1, self.X2, Z_masked, 30, cmap='viridis', alpha=0.6)
+        fig.colorbar(cp, ax=ax, label='f(x)')
+        
+        ax.contour(self.X1, self.X2, self.G, levels=[0], colors=['red'], 
+                  linewidths=2, alpha=0.8)
+        ax.contourf(self.X1, self.X2, self.G, levels=[0, 1e10], 
+                   colors=['lightgreen'], alpha=0.3)
+        
+        if trajectories:
+            colors = ['cyan', 'magenta', 'yellow', 'orange', 'purple', 'pink', 'lime', 'brown']
+            for idx, trajectory in enumerate(trajectories):
+                traj_x1 = [p[0] for p in trajectory]
+                traj_x2 = [p[1] for p in trajectory]
+                
+                color = colors[idx % len(colors)]
+                alpha = 0.3 if idx > 0 else 0.5
+                linewidth = 1.0 if idx > 0 else 2.0
+                
+                ax.plot(traj_x1, traj_x2, '-', color=color, linewidth=linewidth, 
+                       alpha=alpha, label=f'Run {idx+1}')
+                ax.scatter(traj_x1[0], traj_x2[0], color=color, s=20, marker='o', alpha=0.5)
+        
+        if best_trajectory:
+            traj_x1 = [p[0] for p in best_trajectory]
+            traj_x2 = [p[1] for p in best_trajectory]
+            
+            ax.plot(traj_x1, traj_x2, 'gold', linewidth=3, label='BEST Path')
+            ax.scatter(traj_x1[0], traj_x2[0], color='green', s=100, label='Start', zorder=5)
+            ax.scatter(traj_x1[-1], traj_x2[-1], color='blue', s=100, label='End', zorder=5)
+        
+        ax.set_xlabel('x1', fontsize=12)
+        ax.set_ylabel('x2', fontsize=12)
+        ax.grid(True, alpha=0.3)
+        
+        if title:
+            display_title = title
+        else:
+            display_title = f'Safe Gradient Flow - 2D View\nf(x1, x2) = {self.func_str}\n{self.constraint_display}'
+        
+        if alpha_val is not None:
+            display_title += f'\nAlpha = {alpha_val:.4f}'
+        elif self.alpha is not None:
+            display_title += f'\nAlpha = {self.alpha:.4f}'
+        
+        ax.set_title(display_title, fontsize=14)
+        
+        from matplotlib.patches import Patch
+        from matplotlib.lines import Line2D
+        
+        legend_elements = [
+            Patch(facecolor='lightgreen', alpha=0.5, label='Safe region g(x) > 0'),
+            Line2D([0], [0], color='red', linewidth=2, label='Constraint boundary g(x)=0')
+        ]
+        
+        if trajectories and len(trajectories) > 1:
+            colors = ['cyan', 'magenta', 'yellow', 'orange', 'purple', 'pink', 'lime', 'brown']
+            for idx in range(min(3, len(trajectories))):
+                color = colors[idx % len(colors)]
+                legend_elements.append(Line2D([0], [0], color=color, linewidth=2, 
+                                             label=f'Run {idx+1}'))
+        
+        if best_trajectory:
+            legend_elements.append(Line2D([0], [0], color='gold', linewidth=3, label='BEST Path'))
+            legend_elements.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='green', 
+                                          markersize=10, label='Start'))
+            legend_elements.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', 
+                                          markersize=10, label='End'))
+        
+        ax.legend(handles=legend_elements, loc='upper right')
+        plt.tight_layout()
+        return fig, ax
+    
+    def evaluate_point(self, x1, x2):
+        try:
+            self.namespace['x1'] = x1
+            self.namespace['x2'] = x2
+            val = eval(self.func_str, {"__builtins__": {}}, self.namespace)
+            if np.isinf(val) or np.isnan(val) or abs(val) > 1e100:
+                return float('inf')
+            return val
+        except:
+            return float('inf')
+    
+    def evaluate_constraint(self, x1, x2):
+        try:
+            self.namespace['x1'] = x1
+            self.namespace['x2'] = x2
+            val = eval(self.constraint_str, {"__builtins__": {}}, self.namespace)
+            if np.isinf(val) or np.isnan(val) or abs(val) > 1e100:
+                return float('inf')
+            return val
+        except:
+            return float('inf')
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description='Safe Gradient Flow with Adam Adaptive Learning Rate',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single constraint
+  python safe_gradient.py -f "x1**2 + x2**2" -g "x1 + x2 => 1" -s "0.5,0.5" -i 100
+  
+  # Multiple constraints (use 'and' to separate)
+  python safe_gradient.py -f "x1**2 + x2**2" -g "x1 + x2 => 1 and x1 - x2 => 0.5" -s "0.8,0.8" -i 200
+  
+  # Circle constraint with quadratic objective
+  python safe_gradient.py -f "x1**2 + x2**2" -g "x1**2 + x2**2 => 0.25" -s "0.1,0.1" -i 200
+  
+  # Multiple complex constraints
+  python safe_gradient.py -f "20 + x1**2 + x2**2 - 10*(cos(2*pi*x1) + cos(2*pi*x2))" -g "sin(x1) + cos(x2) => 0.5 and x1**2 + x2**2 => 0.25" -s "0.5,0.5" -i 300
+        """
+    )
+    parser.add_argument(
+        '-f', '--function',
+        type=str,
+        required=True,
+        help='Objective function to minimize (e.g., "x1**2 + x2**2")'
+    )
+    parser.add_argument(
+        '-g', '--constraint',
+        type=str,
+        required=True,
+        help='Constraint(s) in format "expression => value" (e.g., "x1 + x2 => 1"). Use "and" for multiple constraints'
+    )
+    parser.add_argument(
+        '-s', '--start',
+        type=str,
+        required=True,
+        help='Starting values, comma-separated (e.g., "0.5, 0.5")'
+    )
+    parser.add_argument(
+        '-lr', '--learning_rate',
+        type=float,
+        default=None,
+        help='Initial learning rate (auto-selected if not provided)'
+    )
+    parser.add_argument(
+        '-a', '--alpha',
+        type=float,
+        default=None,
+        help='Safety parameter alpha for restoring force (auto-selected if not provided)'
+    )
+    parser.add_argument(
+        '-i', '--iterations',
+        type=int,
+        default=200,
+        help='Maximum number of iterations per run (default: 200)'
+    )
+    parser.add_argument(
+        '--no-plots',
+        action='store_true',
+        help='Disable plotting (run in headless mode)'
+    )
+    parser.add_argument(
+        '--save',
+        type=str,
+        metavar='PREFIX',
+        help='Save plots to files with this prefix'
+    )
+    parser.add_argument(
+        '--multi',
+        type=int,
+        metavar='N',
+        help='Multi-start: run safe gradient flow N times from different starting points'
+    )
+    parser.add_argument(
+        '--range',
+        type=str,
+        default='-1,1',
+        help='Range for random starting points in multi-start mode'
+    )
+    parser.add_argument(
+        '--noise',
+        type=float,
+        metavar='AMOUNT',
+        help='Add random noise to learning rate at intervals (e.g., 0.5)'
+    )
+    parser.add_argument(
+        '--noise_freq',
+        type=int,
+        default=10,
+        help='Frequency of noise injection (every N iterations, default: 10)'
+    )
+    parser.add_argument(
+        '--adam_beta1',
+        type=float,
+        default=0.9,
+        help='Adam beta1 parameter (default: 0.9)'
+    )
+    parser.add_argument(
+        '--adam_beta2',
+        type=float,
+        default=0.999,
+        help='Adam beta2 parameter (default: 0.999)'
+    )
+    parser.add_argument(
+        '--adam_epsilon',
+        type=float,
+        default=1e-8,
+        help='Adam epsilon parameter (default: 1e-8)'
+    )
+    return parser.parse_args()
+
+
+def safe_get_input(prompt, input_type=str, validation=None, error_msg="Invalid input. Try again."):
+    while True:
+        try:
+            user_input = input(prompt)
+            if input_type != str:
+                user_input = input_type(user_input)
+            if validation and not validation(user_input):
+                print(error_msg)
+                continue
+            return user_input
+        except ValueError:
+            print(f"  Invalid input. Expected {input_type.__name__}. Try again.")
+
+
+def validate_functions(func_str, constraint_str, namespace, num_vars=2):
+    test_vals = [0.5] * num_vars
+    try:
+        for i, val in enumerate(test_vals):
+            namespace[f'x{i+1}'] = val
+        result = eval(func_str, {"__builtins__": {}}, namespace)
+        if not isinstance(result, (int, float)):
+            print(f"   Function returned {type(result)} instead of number")
+            return False
+        parsed_constraint, _ = parse_constraint(constraint_str)
+        result = eval(parsed_constraint, {"__builtins__": {}}, namespace)
+        if not isinstance(result, (int, float)):
+            print(f"   Constraint returned {type(result)} instead of number")
+            return False
+        return True
+    except Exception as e:
+        print(f"   Function validation failed: {e}")
+        return False
+
+
+def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rate, alpha, 
+                             max_iterations, noise_amount=0, noise_freq=10,
+                             beta1=0.9, beta2=0.999, epsilon=1e-8, verbose=True):
+    """
+    Run safe gradient flow with Adam adaptive learning rate.
+    
+    The safe gradient flow is:
+    dx/dt = -∇f + (∇g/||∇g||²) * max(0, -α*g + ∇g·∇f)
+    
+    When constraint is violated (g < 0), a strong correction pushes toward the feasible region.
+    """
+    
+    num_vars = len(start_values)
+    var_names = [f'x{i+1}' for i in range(num_vars)]
+    
+    parsed_constraint, constraint_display = parse_constraint(constraint_str)
+    
+    namespace = {
+        'sin': math.sin, 'cos': math.cos, 'tan': math.tan,
+        'exp': math.exp, 'log': math.log, 'log10': math.log10,
+        'sqrt': math.sqrt, 'pi': math.pi, 'e': math.e,
+        'abs': abs, 'min': min, 'max': max
+    }
+    
+    for i, val in enumerate(start_values):
+        namespace[f'x{i+1}'] = val
+    
+    if not validate_functions(func_str, constraint_str, namespace, num_vars):
+        print("Function validation failed. Please check your syntax.")
+        return None, None, None, None, None, None, None
+    
+    def func(vals):
+        try:
+            for i, val in enumerate(vals):
+                namespace[f'x{i+1}'] = val
+            val = eval(func_str, {"__builtins__": {}}, namespace)
+            if np.isinf(val) or np.isnan(val) or abs(val) > 1e100:
+                return float('inf')
+            return val
+        except:
+            return float('inf')
+    
+    # Parse the constraint string to get individual constraints for gradient computation
+    def get_individual_constraints(constraint_str):
+        """Parse constraint string and return list of individual constraint functions."""
+        if ' and ' in constraint_str.lower():
+            parts = re.split(r'\s+and\s+', constraint_str, flags=re.IGNORECASE)
+            constraints = []
+            for part in parts:
+                parsed, _ = parse_single_constraint(part)
+                constraints.append(parsed)
+            return constraints
+        else:
+            parsed, _ = parse_single_constraint(constraint_str)
+            return [parsed]
+    
+    # Get individual constraints
+    individual_constraints = get_individual_constraints(constraint_str)
+    
+    def constraint(vals):
+        """Combined constraint function."""
+        try:
+            for i, val in enumerate(vals):
+                namespace[f'x{i+1}'] = val
+            val = eval(parsed_constraint, {"__builtins__": {}}, namespace)
+            if np.isinf(val) or np.isnan(val) or abs(val) > 1e100:
+                return -float('inf')
+            return val
+        except:
+            return -float('inf')
+    
+    def compute_gradients(vals, h=1e-7):
+        f_current = func(vals)
+        g_current = constraint(vals)
+        
+        grad_f = []
+        grad_g = []
+        
+        # Compute gradient of f
+        for i in range(len(vals)):
+            vals_plus = vals.copy()
+            vals_plus[i] += h
+            f_plus = func(vals_plus)
+            partial_f = (f_plus - f_current) / h
+            if np.isinf(partial_f) or np.isnan(partial_f):
+                partial_f = 1e6 if f_plus > f_current else -1e6
+            if abs(partial_f) > 1e6:
+                partial_f = math.copysign(1e6, partial_f)
+            grad_f.append(partial_f)
+        
+        # Compute gradient of g (the active constraint)
+        # For multiple constraints, we need to find which one is active
+        active_constraint_idx = -1
+        min_g = float('inf')
+        
+        for idx, constr in enumerate(individual_constraints):
+            try:
+                for i, val in enumerate(vals):
+                    namespace[f'x{i+1}'] = val
+                g_val = eval(constr, {"__builtins__": {}}, namespace)
+                if g_val < min_g:
+                    min_g = g_val
+                    active_constraint_idx = idx
+            except:
+                pass
+        
+        # If we have multiple constraints, use the active one for the gradient
+        if active_constraint_idx >= 0:
+            active_constr = individual_constraints[active_constraint_idx]
+            for i in range(len(vals)):
+                vals_plus = vals.copy()
+                vals_plus[i] += h
+                try:
+                    for j, val in enumerate(vals_plus):
+                        namespace[f'x{j+1}'] = val
+                    g_plus = eval(active_constr, {"__builtins__": {}}, namespace)
+                    g_current_active = min_g
+                    partial_g = (g_plus - g_current_active) / h
+                except:
+                    partial_g = 0.0
+                
+                if np.isinf(partial_g) or np.isnan(partial_g):
+                    partial_g = 1e6 if g_plus > g_current_active else -1e6
+                if abs(partial_g) > 1e6:
+                    partial_g = math.copysign(1e6, partial_g)
+                grad_g.append(partial_g)
+        else:
+            # Fallback to the combined constraint
+            for i in range(len(vals)):
+                vals_plus = vals.copy()
+                vals_plus[i] += h
+                g_plus = constraint(vals_plus)
+                partial_g = (g_plus - g_current) / h
+                if np.isinf(partial_g) or np.isnan(partial_g):
+                    partial_g = 1e6 if g_plus > g_current else -1e6
+                if abs(partial_g) > 1e6:
+                    partial_g = math.copysign(1e6, partial_g)
+                grad_g.append(partial_g)
+        
+        return grad_f, grad_g, f_current, g_current
+    
+    m = [0.0] * num_vars
+    v = [0.0] * num_vars
+    t = 0
+    
+    x = start_values.copy()
+    history = [x.copy()]
+    f_history = [func(x)]
+    g_history = [constraint(x)]
+    
+    if g_history[0] < 0:
+        print(f"Warning: Start point violates constraint! g(x) = {g_history[0]:.6f}")
+        print("The algorithm will prioritize constraint satisfaction.")
+    
+    if verbose:
+        print(f"\nSafe Gradient Flow with Adam")
+        print(f"f(x) = {func_str}")
+        print(f"Constraint: {constraint_display}")
+        print(f"Start: {', '.join([f'{v:.6f}' for v in start_values])}")
+        print(f"Initial Learning Rate: {learning_rate:.6f}")
+        print(f"Alpha: {alpha:.6f}")
+        print(f"Adam beta1: {beta1:.4f}, beta2: {beta2:.4f}")
+        if noise_amount > 0:
+            print(f"Noise: {noise_amount} (every {noise_freq} iterations)")
+        print("-" * 70)
+        print(f"{'Iter':<6} | {'x1':<12} | {'x2':<12} | {'f(x)':<14} | {'g(x)':<14} | {'LR':<10}")
+        print("-" * 70)
+    
+    current_lr = learning_rate
+    lr_reductions = 0
+    max_lr_reductions = 10
+    
+    prev_f_vals = []
+    prev_g_vals = []
+    
+    for i in range(max_iterations):
+        t += 1
+        
+        grad_f, grad_g, f_val, g_val = compute_gradients(x)
+        
+        grad_g_mag = math.sqrt(sum(g**2 for g in grad_g))
+        
+        # If constraint is violated, move toward feasibility
+        if g_val < -0.001:
+            if grad_g_mag > 1e-10:
+                norm_grad_g = [grad_g[j] / grad_g_mag for j in range(num_vars)]
+                step_size = min(0.5, -g_val * 0.3)
+                update = [step_size * norm_grad_g[j] for j in range(num_vars)]
+                
+                if verbose and i % 10 == 0:
+                    print(f"        Violation mode: g={g_val:.4f}, step={step_size:.4f}")
+            else:
+                update = [0.01 * random.uniform(-1, 1) for _ in range(num_vars)]
+        else:
+            # Safe region - perform standard safe gradient flow
+            descent = [-grad_f[j] for j in range(num_vars)]
+            
+            if grad_g_mag > 1e-10:
+                dot_product = sum(grad_f[j] * grad_g[j] for j in range(num_vars))
+                scalar = -alpha * g_val + dot_product
+                
+                if scalar > 0:
+                    max_correction = 1.0
+                    if scalar > max_correction:
+                        scalar = max_correction
+                    elif scalar < -max_correction:
+                        scalar = -max_correction
+                    
+                    correction = [(grad_g[j] / (grad_g_mag ** 2)) * scalar for j in range(num_vars)]
+                    update = [descent[j] + correction[j] for j in range(num_vars)]
+                else:
+                    update = descent
+            else:
+                update = descent
+        
+        if noise_amount > 0 and i > 0 and i % noise_freq == 0:
+            noise = random.uniform(-noise_amount, noise_amount)
+            current_lr = max(0.0000001, learning_rate + noise * learning_rate)
+            if verbose:
+                print(f"        Noise injected: LR {learning_rate:.6f} -> {current_lr:.6f}")
+        
+        for j in range(num_vars):
+            m[j] = beta1 * m[j] + (1 - beta1) * update[j]
+            v[j] = beta2 * v[j] + (1 - beta2) * (update[j] ** 2)
+            
+            m_hat = m[j] / (1 - beta1 ** t)
+            v_hat = v[j] / (1 - beta2 ** t)
+            
+            step = current_lr * m_hat / (math.sqrt(v_hat) + epsilon)
+            
+            max_step = 0.1
+            if abs(step) > max_step:
+                step = math.copysign(max_step, step)
+            
+            x[j] = x[j] + step
+        
+        f_new = func(x)
+        g_new = constraint(x)
+        
+        # Oscillation detection
+        prev_f_vals.append(f_new)
+        if len(prev_f_vals) > 10:
+            prev_f_vals.pop(0)
+        
+        prev_g_vals.append(g_new)
+        if len(prev_g_vals) > 10:
+            prev_g_vals.pop(0)
+        
+        oscillating = False
+        if len(prev_f_vals) >= 10:
+            diffs = [prev_f_vals[i+1] - prev_f_vals[i] for i in range(len(prev_f_vals)-1)]
+            sign_changes = sum(1 for i in range(len(diffs)-1) if diffs[i] * diffs[i+1] < 0)
+            if sign_changes >= 3:
+                oscillating = True
+        
+        if len(prev_g_vals) >= 10:
+            crosses_zero = sum(1 for i in range(len(prev_g_vals)-1) if prev_g_vals[i] * prev_g_vals[i+1] < 0)
+            if crosses_zero >= 4:
+                oscillating = True
+        
+        if oscillating and lr_reductions < max_lr_reductions:
+            current_lr = current_lr * 0.5
+            lr_reductions += 1
+            if verbose:
+                print(f"        Oscillation detected! Reducing LR to {current_lr:.8f}")
+            prev_f_vals = []
+            prev_g_vals = []
+        
+        if verbose:
+            if abs(f_new) < 0.001 or abs(f_new) > 1000:
+                f_str = f"{f_new:<14.6e}"
+            else:
+                f_str = f"{f_new:<14.8f}"
+            if abs(g_new) < 0.001 or abs(g_new) > 1000:
+                g_str = f"{g_new:<14.6e}"
+            else:
+                g_str = f"{g_new:<14.8f}"
+            row = f"{i:<6} | {x[0]:<12.6f} | {x[1]:<12.6f} | {f_str} | {g_str} | {current_lr:<10.8f}"
+            print(row)
+        
+        grad_magnitude = math.sqrt(sum(update[j] ** 2 for j in range(num_vars)))
+        if grad_magnitude < 1e-8 and g_new >= 0:
+            if verbose:
+                print("-" * 70)
+                print(f"    Converged after {i+1} iterations! (gradient magnitude = {grad_magnitude:.2e})")
+            break
+        
+        history.append(x.copy())
+        f_history.append(f_new)
+        g_history.append(g_new)
+        
+        if any(abs(val) > 1e10 for val in x):
+            if verbose:
+                print("-" * 70)
+                print("      WARNING: Values are exploding! Try a smaller learning rate.")
+            break
+    
+    final_f = func(x)
+    final_g = constraint(x)
+    
+    if verbose:
+        print("-" * 70)
+        print(f"FINAL RESULT:")
+        for j, name in enumerate(var_names):
+            print(f"  {name} = {x[j]:.10f}")
+        print(f"  f(x) = {final_f:.16f}")
+        print(f"  g(x) = {final_g:.16f} {'(SAFE)' if final_g >= 0 else '(VIOLATED)'}")
+        if lr_reductions > 0:
+            print(f"  Learning rate reductions: {lr_reductions}")
+        print("-" * 70)
+    
+    return history, f_history, g_history, x, final_f, final_g, constraint_display
+
+
+def plot_convergence(history, f_history, g_history, var_names, title=None, alpha_val=None):
+    iterations = list(range(len(history)))
+    
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+    
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
+    for i, name in enumerate(var_names):
+        values = [point[i] for point in history]
+        color = colors[i % len(colors)]
+        axes[0].plot(iterations, values, 'o-', color=color, linewidth=2, 
+                    markersize=3, label=name)
+    axes[0].set_xlabel('Iteration', fontsize=12)
+    axes[0].set_ylabel('Variable Value', fontsize=12)
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+    axes[0].set_title('Variable Convergence', fontsize=14)
+    
+    axes[1].plot(iterations, f_history, 'b-', linewidth=2)
+    axes[1].set_xlabel('Iteration', fontsize=12)
+    axes[1].set_ylabel('f(x)', fontsize=12)
+    axes[1].grid(True, alpha=0.3)
+    axes[1].set_title('Objective Function Value', fontsize=14)
+    if f_history and max(f_history) > 0:
+        axes[1].set_yscale('log')
+    
+    axes[2].plot(iterations, g_history, 'g-', linewidth=2)
+    axes[2].axhline(y=0, color='red', linestyle='--', alpha=0.7, label='Safety boundary g(x)=0')
+    if g_history and max(g_history) > 0:
+        axes[2].fill_between(iterations, 0, max(g_history), 
+                             color='green', alpha=0.1, label='Safe region')
+    axes[2].set_xlabel('Iteration', fontsize=12)
+    axes[2].set_ylabel('g(x)', fontsize=12)
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend()
+    axes[2].set_title('Constraint Function (g(x) >= 0 for safety)', fontsize=14)
+    
+    if title:
+        display_title = title
+    else:
+        display_title = 'Safe Gradient Flow Convergence'
+    
+    if alpha_val is not None:
+        display_title += f' (Alpha = {alpha_val:.4f})'
+    
+    fig.suptitle(display_title, fontsize=16)
+    plt.tight_layout()
+    return fig, axes
+
+
+def main():
+    args = parse_arguments()
+    
+    if args.start:
+        start_values = [float(x.strip()) for x in args.start.split(',')]
+    else:
+        print("Error: Starting values required. Use -s")
+        return
+    
+    num_vars = len(start_values)
+    
+    if num_vars != 2:
+        print("Warning: This visualization is optimized for 2D functions.")
+        print("The algorithm will still run, but 3D plots will not be generated.")
+    
+    namespace = {
+        'sin': math.sin, 'cos': math.cos, 'tan': math.tan,
+        'exp': math.exp, 'log': math.log, 'log10': math.log10,
+        'sqrt': math.sqrt, 'pi': math.pi, 'e': math.e,
+        'abs': abs, 'min': min, 'max': max
+    }
+    
+    if not validate_functions(args.function, args.constraint, namespace, num_vars):
+        print("Function validation failed. Exiting.")
+        return
+    
+    if args.learning_rate is None or args.alpha is None:
+        suggested_lr, suggested_alpha, reason = suggest_parameters(
+            args.function, args.constraint, start_values
+        )
+        
+        if args.learning_rate is None:
+            learning_rate = suggested_lr
+            print(f"Auto-selected learning rate: {learning_rate:.6f}")
+        else:
+            learning_rate = args.learning_rate
+        
+        if args.alpha is None:
+            alpha = suggested_alpha
+            print(f"Auto-selected alpha: {alpha:.4f}")
+        else:
+            alpha = args.alpha
+        
+        print(f"Reason: {reason}")
+        print("-" * 70)
+    else:
+        learning_rate = args.learning_rate
+        alpha = args.alpha
+    
+    if learning_rate > 0.01:
+        print(f"Warning: Learning rate ({learning_rate}) is high. Consider using -lr 0.001 for stability.")
+    
+    if alpha > 2.0:
+        print(f"Warning: Alpha ({alpha}) is high. Consider using -a 1.0 for stability.")
+    
+    multi_start = args.multi is not None and args.multi > 1
+    num_starts = args.multi if multi_start else 1
+    
+    range_parts = args.range.split(',')
+    min_val = float(range_parts[0].strip())
+    max_val = float(range_parts[1].strip())
+    
+    all_trajectories = []
+    all_f_histories = []
+    all_g_histories = []
+    best_trajectory = None
+    best_f = float('inf')
+    best_x = None
+    best_g = None
+    best_f_history = None
+    best_g_history = None
+    constraint_display = args.constraint
+    
+    if multi_start:
+        print(f"\nMulti-start mode: Running {num_starts} starts...")
+        print(f"Random start range: [{min_val}, {max_val}]")
+        print(f"Alpha: {alpha:.6f}")
+        print(f"Constraint: {args.constraint}")
+        print("-" * 70)
+        
+        for run in range(num_starts):
+            current_start = [random.uniform(min_val, max_val) for _ in range(num_vars)]
+            
+            print(f"\n--- Run {run + 1}/{num_starts} ---")
+            print(f"Start: {current_start}")
+            
+            history, f_history, g_history, final_x, final_f, final_g, constraint_display = safe_gradient_flow_adam(
+                func_str=args.function,
+                constraint_str=args.constraint,
+                start_values=current_start,
+                learning_rate=learning_rate,
+                alpha=alpha,
+                max_iterations=args.iterations,
+                noise_amount=args.noise or 0,
+                noise_freq=args.noise_freq,
+                beta1=args.adam_beta1,
+                beta2=args.adam_beta2,
+                epsilon=args.adam_epsilon,
+                verbose=False
+            )
+            
+            if history is not None:
+                all_trajectories.append(history)
+                all_f_histories.append(f_history)
+                all_g_histories.append(g_history)
+                
+                print(f"  Final: f(x) = {final_f:.6f}, g(x) = {final_g:.6f}")
+                
+                if final_f < best_f and final_g >= 0:
+                    best_f = final_f
+                    best_trajectory = history
+                    best_x = final_x
+                    best_g = final_g
+                    best_f_history = f_history
+                    best_g_history = g_history
+                    print(f"    NEW BEST: f(x) = {best_f:.6f}")
+        
+        print("\n" + "=" * 70)
+        print("Multi-start Summary")
+        print("=" * 70)
+        print(f"Best f(x): {best_f:.10f}")
+        print(f"Best x: {best_x}")
+        print(f"Runs completed: {num_starts}")
+        print(f"Alpha: {alpha:.6f}")
+        print(f"Constraint: {args.constraint}")
+        print("=" * 70)
+        
+        if best_trajectory is None and all_trajectories:
+            print("Warning: No run satisfied the constraint. Using best available.")
+            best_trajectory = all_trajectories[0]
+            best_x = all_trajectories[0][-1]
+    
+    else:
+        history, f_history, g_history, final_x, final_f, final_g, constraint_display = safe_gradient_flow_adam(
+            func_str=args.function,
+            constraint_str=args.constraint,
+            start_values=start_values,
+            learning_rate=learning_rate,
+            alpha=alpha,
+            max_iterations=args.iterations,
+            noise_amount=args.noise or 0,
+            noise_freq=args.noise_freq,
+            beta1=args.adam_beta1,
+            beta2=args.adam_beta2,
+            epsilon=args.adam_epsilon,
+            verbose=True
+        )
+        
+        if history is None:
+            return
+        
+        all_trajectories = [history]
+        best_trajectory = history
+        best_f = final_f
+        best_x = final_x
+        best_g = final_g
+        best_f_history = f_history
+        best_g_history = g_history
+    
+    if not args.no_plots:
+        var_names = [f'x{i+1}' for i in range(num_vars)]
+        
+        if num_vars == 2:
+            all_x1 = []
+            all_x2 = []
+            for traj in all_trajectories:
+                for point in traj:
+                    all_x1.append(point[0])
+                    all_x2.append(point[1])
+            
+            if all_x1 and all_x2:
+                x1_range = (min(all_x1) - 0.5, max(all_x1) + 0.5)
+                x2_range = (min(all_x2) - 0.5, max(all_x2) + 0.5)
+                x1_range = (min(x1_range[0], -1), max(x1_range[1], 1))
+                x2_range = (min(x2_range[0], -1), max(x2_range[1], 1))
+            else:
+                x1_range = (-3, 3)
+                x2_range = (-3, 3)
+            
+            print("\n[1/3] Generating 3D visualization...")
+            ls = LossSurface(args.function, args.constraint, x1_range, x2_range, alpha=alpha)
+            
+            fig_3d, ax_3d = ls.plot_3d(
+                trajectories=all_trajectories if multi_start else None,
+                best_trajectory=best_trajectory,
+                title=f'Safe Gradient Flow\nf: {args.function}\n{constraint_display}',
+                alpha_val=alpha
+            )
+            
+            if args.save:
+                fig_3d.savefig(f'{args.save}_3d.png', dpi=300, bbox_inches='tight')
+                print(f"    Saved: {args.save}_3d.png")
+            else:
+                plt.show()
+            
+            print("\n[2/3] Generating 2D contour visualization...")
+            fig_contour, ax_contour = ls.plot_contour(
+                trajectories=all_trajectories if multi_start else None,
+                best_trajectory=best_trajectory,
+                title=f'Safe Gradient Flow - 2D View\nf: {args.function}\n{constraint_display}',
+                alpha_val=alpha
+            )
+            
+            if args.save:
+                fig_contour.savefig(f'{args.save}_contour.png', dpi=300, bbox_inches='tight')
+                print(f"    Saved: {args.save}_contour.png")
+            else:
+                plt.show()
+        
+        print("\n[3/3] Generating convergence plots...")
+        fig_conv, axes_conv = plot_convergence(
+            history=best_trajectory if best_trajectory else history,
+            f_history=best_f_history if best_f_history else f_history,
+            g_history=best_g_history if best_g_history else g_history,
+            var_names=var_names,
+            title=f'Safe Gradient Flow Convergence\nf: {args.function}',
+            alpha_val=alpha
+        )
+        
+        if args.save:
+            fig_conv.savefig(f'{args.save}_convergence.png', dpi=300, bbox_inches='tight')
+            print(f"    Saved: {args.save}_convergence.png")
+        else:
+            plt.show()
+    
+    return best_x, best_f, best_g
+
+
+if __name__ == "__main__":
+    try:
+        import numpy
+        import matplotlib
+        import argparse
+    except ImportError:
+        print("\n      Required libraries not installed.")
+        print("   Please install them with:")
+        print("   pip install numpy matplotlib")
+        print("-" * 70)
+    
+    main()
