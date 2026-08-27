@@ -568,7 +568,7 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
     
     if not validate_functions(func_str, constraint_str, namespace, num_vars):
         print("Function validation failed. Please check your syntax.")
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
     
     def func(vals):
         try:
@@ -630,7 +630,6 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
             grad_f.append(partial_f)
         
         # Compute gradient of g (the active constraint)
-        # For multiple constraints, we need to find which one is active
         active_constraint_idx = -1
         min_g = float('inf')
         
@@ -645,7 +644,6 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
             except:
                 pass
         
-        # If we have multiple constraints, use the active one for the gradient
         if active_constraint_idx >= 0:
             active_constr = individual_constraints[active_constraint_idx]
             for i in range(len(vals)):
@@ -666,7 +664,6 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
                     partial_g = math.copysign(1e6, partial_g)
                 grad_g.append(partial_g)
         else:
-            # Fallback to the combined constraint
             for i in range(len(vals)):
                 vals_plus = vals.copy()
                 vals_plus[i] += h
@@ -689,7 +686,14 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
     f_history = [func(x)]
     g_history = [constraint(x)]
     
+    # Track constraint violations
+    violation_count = 0
+    max_violation = 0.0
+    violation_history = [0]  # Track violations per iteration for plotting
+    
     if g_history[0] < 0:
+        violation_count += 1
+        max_violation = abs(g_history[0])
         print(f"Warning: Start point violates constraint! g(x) = {g_history[0]:.6f}")
         print("The algorithm will prioritize constraint satisfaction.")
     
@@ -723,6 +727,11 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
         
         # If constraint is violated, move toward feasibility
         if g_val < -0.001:
+            # Track violation
+            violation_count += 1
+            if abs(g_val) > max_violation:
+                max_violation = abs(g_val)
+            
             if grad_g_mag > 1e-10:
                 norm_grad_g = [grad_g[j] / grad_g_mag for j in range(num_vars)]
                 step_size = min(0.5, -g_val * 0.3)
@@ -733,7 +742,6 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
             else:
                 update = [0.01 * random.uniform(-1, 1) for _ in range(num_vars)]
         else:
-            # Safe region - perform standard safe gradient flow
             descent = [-grad_f[j] for j in range(num_vars)]
             
             if grad_g_mag > 1e-10:
@@ -777,6 +785,9 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
         
         f_new = func(x)
         g_new = constraint(x)
+        
+        # Track violation in history
+        violation_history.append(1 if g_new < -0.001 else 0)
         
         # Oscillation detection
         prev_f_vals.append(f_new)
@@ -846,14 +857,22 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
             print(f"  {name} = {x[j]:.10f}")
         print(f"  f(x) = {final_f:.16f}")
         print(f"  g(x) = {final_g:.16f} {'(SAFE)' if final_g >= 0 else '(VIOLATED)'}")
+        # Display violation statistics
+        if violation_count > 0:
+            print(f"  Constraint violations: {violation_count}")
+            print(f"  Maximum violation: {max_violation:.6f}")
+            violation_percent = (violation_count / len(history)) * 100
+            print(f"  Violation percentage: {violation_percent:.1f}%")
+        else:
+            print(f"  Constraint violations: 0 (Perfectly safe!)")
         if lr_reductions > 0:
             print(f"  Learning rate reductions: {lr_reductions}")
         print("-" * 70)
     
-    return history, f_history, g_history, x, final_f, final_g, constraint_display
+    return history, f_history, g_history, x, final_f, final_g, constraint_display, violation_history
 
 
-def plot_convergence(history, f_history, g_history, var_names, title=None, alpha_val=None):
+def plot_convergence(history, f_history, g_history, var_names, title=None, alpha_val=None, violation_history=None):
     iterations = list(range(len(history)))
     
     fig, axes = plt.subplots(3, 1, figsize=(12, 10))
@@ -886,6 +905,16 @@ def plot_convergence(history, f_history, g_history, var_names, title=None, alpha
     axes[2].set_xlabel('Iteration', fontsize=12)
     axes[2].set_ylabel('g(x)', fontsize=12)
     axes[2].grid(True, alpha=0.3)
+    
+    # Plot violation markers on the constraint plot
+    if violation_history:
+        violation_iters = [i for i, v in enumerate(violation_history) if v > 0]
+        if violation_iters:
+            # Get g values at violation points
+            violation_vals = [g_history[i] if i < len(g_history) else 0 for i in violation_iters]
+            axes[2].scatter(violation_iters, violation_vals, color='red', s=40, 
+                          marker='x', zorder=5, label='Constraint violation')
+    
     axes[2].legend()
     axes[2].set_title('Constraint Function (g(x) >= 0 for safety)', fontsize=14)
     
@@ -901,6 +930,53 @@ def plot_convergence(history, f_history, g_history, var_names, title=None, alpha
     plt.tight_layout()
     return fig, axes
 
+def export_trajectory_data(history, f_history, g_history, var_names, constraint_display, prefix="trajectory"):
+    """
+    Export trajectory data to CSV files for external analysis.
+    
+    Parameters:
+    - history: List of variable value lists from gradient descent
+    - f_history: History of objective values
+    - g_history: History of constraint values
+    - var_names: List of variable names
+    - constraint_display: Display string for the constraint
+    - prefix: Prefix for output filenames
+    """
+    import csv
+    
+    # Export variables history
+    var_filename = f"{prefix}_variables.csv"
+    with open(var_filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        # Header
+        header = ['Iteration'] + var_names
+        writer.writerow(header)
+        # Data
+        for i, vals in enumerate(history):
+            row = [i] + vals
+            writer.writerow(row)
+    print(f"    Exported variable history to: {var_filename}")
+    
+    # Export objective and constraint history
+    func_filename = f"{prefix}_functions.csv"
+    with open(func_filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        # Header
+        writer.writerow(['Iteration', 'f(x)', 'g(x)'])
+        # Data
+        for i in range(len(f_history)):
+            writer.writerow([i, f_history[i], g_history[i] if i < len(g_history) else ''])
+    print(f"    Exported function history to: {func_filename}")
+    
+    # Export metadata
+    meta_filename = f"{prefix}_metadata.txt"
+    with open(meta_filename, 'w') as f:
+        f.write(f"Objective function: {', '.join(var_names)}\n")
+        f.write(f"Constraint: {constraint_display}\n")
+        f.write(f"Number of iterations: {len(history)}\n")
+        f.write(f"Final f(x): {f_history[-1] if f_history else 'N/A'}\n")
+        f.write(f"Final g(x): {g_history[-1] if g_history else 'N/A'}\n")
+    print(f"    Exported metadata to: {meta_filename}")
 
 def main():
     args = parse_arguments()
@@ -988,7 +1064,7 @@ def main():
             print(f"\n--- Run {run + 1}/{num_starts} ---")
             print(f"Start: {current_start}")
             
-            history, f_history, g_history, final_x, final_f, final_g, constraint_display = safe_gradient_flow_adam(
+            history, f_history, g_history, final_x, final_f, final_g, constraint_display, violation_history = safe_gradient_flow_adam(
                 func_str=args.function,
                 constraint_str=args.constraint,
                 start_values=current_start,
@@ -1007,8 +1083,13 @@ def main():
                 all_trajectories.append(history)
                 all_f_histories.append(f_history)
                 all_g_histories.append(g_history)
+                all_violation_histories.append(violation_history)
                 
+                # Print violation info for this run
+                violation_count = sum(1 for v in violation_history if v > 0)
+                max_viol = max(abs(v) for v in g_history if v < 0) if any(v < 0 for v in g_history) else 0
                 print(f"  Final: f(x) = {final_f:.6f}, g(x) = {final_g:.6f}")
+                print(f"  Violations: {violation_count} (max: {max_viol:.6f})")
                 
                 if final_f < best_f and final_g >= 0:
                     best_f = final_f
@@ -1017,6 +1098,8 @@ def main():
                     best_g = final_g
                     best_f_history = f_history
                     best_g_history = g_history
+                    best_violation_history = violation_history
+                    best_run_idx = run
                     print(f"    NEW BEST: f(x) = {best_f:.6f}")
         
         print("\n" + "=" * 70)
@@ -1024,6 +1107,10 @@ def main():
         print("=" * 70)
         print(f"Best f(x): {best_f:.10f}")
         print(f"Best x: {best_x}")
+        print(f"Best run: {best_run_idx + 1}/{num_starts}")
+        if best_violation_history:
+            best_violations = sum(1 for v in best_violation_history if v > 0)
+            print(f"Best run violations: {best_violations}")
         print(f"Runs completed: {num_starts}")
         print(f"Alpha: {alpha:.6f}")
         print(f"Constraint: {args.constraint}")
@@ -1035,7 +1122,7 @@ def main():
             best_x = all_trajectories[0][-1]
     
     else:
-        history, f_history, g_history, final_x, final_f, final_g, constraint_display = safe_gradient_flow_adam(
+        history, f_history, g_history, final_x, final_f, final_g, constraint_display, violation_history = safe_gradient_flow_adam(
             func_str=args.function,
             constraint_str=args.constraint,
             start_values=start_values,
@@ -1060,6 +1147,7 @@ def main():
         best_g = final_g
         best_f_history = f_history
         best_g_history = g_history
+        best_violation_history = violation_history
     
     if not args.no_plots:
         var_names = [f'x{i+1}' for i in range(num_vars)]
@@ -1118,7 +1206,8 @@ def main():
             g_history=best_g_history if best_g_history else g_history,
             var_names=var_names,
             title=f'Safe Gradient Flow Convergence\nf: {args.function}',
-            alpha_val=alpha
+            alpha_val=alpha,
+            violation_history=best_violation_history
         )
         
         if args.save:
@@ -1129,6 +1218,18 @@ def main():
     
     return best_x, best_f, best_g
 
+        # Export trajectory data
+    export_choice = input("\nWould you like to export trajectory data to CSV? (y/n, default = n): ").lower()
+    if export_choice == 'y':
+        prefix = args.save if args.save else "trajectory"
+        export_trajectory_data(
+            history=best_trajectory if best_trajectory else history,
+            f_history=best_f_history if best_f_history else f_history,
+            g_history=best_g_history if best_g_history else g_history,
+            var_names=var_names,
+            constraint_display=constraint_display,
+            prefix=prefix
+        )
 
 if __name__ == "__main__":
     try:
