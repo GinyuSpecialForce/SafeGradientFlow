@@ -502,6 +502,11 @@ Examples:
         default=1e-8,
         help='Adam epsilon parameter (default: 1e-8)'
     )
+    parser.add_argument(
+        '--quiet',
+        action='store_true',
+        help='Suppress iteration-by-iteration output (only show final results)'
+    )
     return parser.parse_args()
 
 
@@ -541,7 +546,7 @@ def validate_functions(func_str, constraint_str, namespace, num_vars=2):
 
 def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rate, alpha, 
                              max_iterations, noise_amount=0, noise_freq=10,
-                             beta1=0.9, beta2=0.999, epsilon=1e-8, verbose=True):
+                             beta1=0.9, beta2=0.999, epsilon=1e-8, verbose=True, quiet=False):
     """
     Run safe gradient flow with Adam adaptive learning rate.
     
@@ -694,10 +699,11 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
     if g_history[0] < 0:
         violation_count += 1
         max_violation = abs(g_history[0])
-        print(f"Warning: Start point violates constraint! g(x) = {g_history[0]:.6f}")
-        print("The algorithm will prioritize constraint satisfaction.")
+        if not quiet:
+            print(f"Warning: Start point violates constraint! g(x) = {g_history[0]:.6f}")
+            print("The algorithm will prioritize constraint satisfaction.")
     
-    if verbose:
+    if verbose and not quiet:
         print(f"\nSafe Gradient Flow with Adam")
         print(f"f(x) = {func_str}")
         print(f"Constraint: {constraint_display}")
@@ -737,7 +743,7 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
                 step_size = min(0.5, -g_val * 0.3)
                 update = [step_size * norm_grad_g[j] for j in range(num_vars)]
                 
-                if verbose and i % 10 == 0:
+                if verbose and not quiet and i % 10 == 0:
                     print(f"        Violation mode: g={g_val:.4f}, step={step_size:.4f}")
             else:
                 update = [0.01 * random.uniform(-1, 1) for _ in range(num_vars)]
@@ -765,7 +771,7 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
         if noise_amount > 0 and i > 0 and i % noise_freq == 0:
             noise = random.uniform(-noise_amount, noise_amount)
             current_lr = max(0.0000001, learning_rate + noise * learning_rate)
-            if verbose:
+            if verbose and not quiet:
                 print(f"        Noise injected: LR {learning_rate:.6f} -> {current_lr:.6f}")
         
         for j in range(num_vars):
@@ -813,12 +819,12 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
         if oscillating and lr_reductions < max_lr_reductions:
             current_lr = current_lr * 0.5
             lr_reductions += 1
-            if verbose:
+            if verbose and not quiet:
                 print(f"        Oscillation detected! Reducing LR to {current_lr:.8f}")
             prev_f_vals = []
             prev_g_vals = []
         
-        if verbose:
+        if verbose and not quiet:
             if abs(f_new) < 0.001 or abs(f_new) > 1000:
                 f_str = f"{f_new:<14.6e}"
             else:
@@ -832,7 +838,7 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
         
         grad_magnitude = math.sqrt(sum(update[j] ** 2 for j in range(num_vars)))
         if grad_magnitude < 1e-8 and g_new >= 0:
-            if verbose:
+            if verbose and not quiet:
                 print("-" * 70)
                 print(f"    Converged after {i+1} iterations! (gradient magnitude = {grad_magnitude:.2e})")
             break
@@ -842,7 +848,7 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
         g_history.append(g_new)
         
         if any(abs(val) > 1e10 for val in x):
-            if verbose:
+            if verbose and not quiet:
                 print("-" * 70)
                 print("      WARNING: Values are exploding! Try a smaller learning rate.")
             break
@@ -850,7 +856,7 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
     final_f = func(x)
     final_g = constraint(x)
     
-    if verbose:
+    if verbose and not quiet:
         print("-" * 70)
         print(f"FINAL RESULT:")
         for j, name in enumerate(var_names):
@@ -930,6 +936,7 @@ def plot_convergence(history, f_history, g_history, var_names, title=None, alpha
     plt.tight_layout()
     return fig, axes
 
+
 def export_trajectory_data(history, f_history, g_history, var_names, constraint_display, prefix="trajectory"):
     """
     Export trajectory data to CSV files for external analysis.
@@ -978,6 +985,7 @@ def export_trajectory_data(history, f_history, g_history, var_names, constraint_
         f.write(f"Final g(x): {g_history[-1] if g_history else 'N/A'}\n")
     print(f"    Exported metadata to: {meta_filename}")
 
+
 def main():
     args = parse_arguments()
     
@@ -1011,26 +1019,29 @@ def main():
         
         if args.learning_rate is None:
             learning_rate = suggested_lr
-            print(f"Auto-selected learning rate: {learning_rate:.6f}")
+            if not args.quiet:
+                print(f"Auto-selected learning rate: {learning_rate:.6f}")
         else:
             learning_rate = args.learning_rate
         
         if args.alpha is None:
             alpha = suggested_alpha
-            print(f"Auto-selected alpha: {alpha:.4f}")
+            if not args.quiet:
+                print(f"Auto-selected alpha: {alpha:.4f}")
         else:
             alpha = args.alpha
         
-        print(f"Reason: {reason}")
-        print("-" * 70)
+        if not args.quiet:
+            print(f"Reason: {reason}")
+            print("-" * 70)
     else:
         learning_rate = args.learning_rate
         alpha = args.alpha
     
-    if learning_rate > 0.01:
+    if learning_rate > 0.01 and not args.quiet:
         print(f"Warning: Learning rate ({learning_rate}) is high. Consider using -lr 0.001 for stability.")
     
-    if alpha > 2.0:
+    if alpha > 2.0 and not args.quiet:
         print(f"Warning: Alpha ({alpha}) is high. Consider using -a 1.0 for stability.")
     
     multi_start = args.multi is not None and args.multi > 1
@@ -1043,26 +1054,31 @@ def main():
     all_trajectories = []
     all_f_histories = []
     all_g_histories = []
+    all_violation_histories = []  # Initialize this variable
     best_trajectory = None
     best_f = float('inf')
     best_x = None
     best_g = None
     best_f_history = None
     best_g_history = None
+    best_violation_history = None
+    best_run_idx = 0
     constraint_display = args.constraint
     
     if multi_start:
-        print(f"\nMulti-start mode: Running {num_starts} starts...")
-        print(f"Random start range: [{min_val}, {max_val}]")
-        print(f"Alpha: {alpha:.6f}")
-        print(f"Constraint: {args.constraint}")
-        print("-" * 70)
+        if not args.quiet:
+            print(f"\nMulti-start mode: Running {num_starts} starts...")
+            print(f"Random start range: [{min_val}, {max_val}]")
+            print(f"Alpha: {alpha:.6f}")
+            print(f"Constraint: {args.constraint}")
+            print("-" * 70)
         
         for run in range(num_starts):
             current_start = [random.uniform(min_val, max_val) for _ in range(num_vars)]
             
-            print(f"\n--- Run {run + 1}/{num_starts} ---")
-            print(f"Start: {current_start}")
+            if not args.quiet:
+                print(f"\n--- Run {run + 1}/{num_starts} ---")
+                print(f"Start: {current_start}")
             
             history, f_history, g_history, final_x, final_f, final_g, constraint_display, violation_history = safe_gradient_flow_adam(
                 func_str=args.function,
@@ -1076,7 +1092,8 @@ def main():
                 beta1=args.adam_beta1,
                 beta2=args.adam_beta2,
                 epsilon=args.adam_epsilon,
-                verbose=False
+                verbose=False,
+                quiet=args.quiet
             )
             
             if history is not None:
@@ -1088,8 +1105,9 @@ def main():
                 # Print violation info for this run
                 violation_count = sum(1 for v in violation_history if v > 0)
                 max_viol = max(abs(v) for v in g_history if v < 0) if any(v < 0 for v in g_history) else 0
-                print(f"  Final: f(x) = {final_f:.6f}, g(x) = {final_g:.6f}")
-                print(f"  Violations: {violation_count} (max: {max_viol:.6f})")
+                if not args.quiet:
+                    print(f"  Final: f(x) = {final_f:.6f}, g(x) = {final_g:.6f}")
+                    print(f"  Violations: {violation_count} (max: {max_viol:.6f})")
                 
                 if final_f < best_f and final_g >= 0:
                     best_f = final_f
@@ -1100,26 +1118,32 @@ def main():
                     best_g_history = g_history
                     best_violation_history = violation_history
                     best_run_idx = run
-                    print(f"    NEW BEST: f(x) = {best_f:.6f}")
+                    if not args.quiet:
+                        print(f"    NEW BEST: f(x) = {best_f:.6f}")
         
-        print("\n" + "=" * 70)
-        print("Multi-start Summary")
-        print("=" * 70)
-        print(f"Best f(x): {best_f:.10f}")
-        print(f"Best x: {best_x}")
-        print(f"Best run: {best_run_idx + 1}/{num_starts}")
-        if best_violation_history:
-            best_violations = sum(1 for v in best_violation_history if v > 0)
-            print(f"Best run violations: {best_violations}")
-        print(f"Runs completed: {num_starts}")
-        print(f"Alpha: {alpha:.6f}")
-        print(f"Constraint: {args.constraint}")
-        print("=" * 70)
+        if not args.quiet:
+            print("\n" + "=" * 70)
+            print("Multi-start Summary")
+            print("=" * 70)
+            print(f"Best f(x): {best_f:.10f}")
+            print(f"Best x: {best_x}")
+            print(f"Best run: {best_run_idx + 1}/{num_starts}")
+            if best_violation_history:
+                best_violations = sum(1 for v in best_violation_history if v > 0)
+                print(f"Best run violations: {best_violations}")
+            print(f"Runs completed: {num_starts}")
+            print(f"Alpha: {alpha:.6f}")
+            print(f"Constraint: {args.constraint}")
+            print("=" * 70)
         
         if best_trajectory is None and all_trajectories:
-            print("Warning: No run satisfied the constraint. Using best available.")
+            if not args.quiet:
+                print("Warning: No run satisfied the constraint. Using best available.")
             best_trajectory = all_trajectories[0]
             best_x = all_trajectories[0][-1]
+            best_f_history = all_f_histories[0]
+            best_g_history = all_g_histories[0]
+            best_violation_history = all_violation_histories[0]
     
     else:
         history, f_history, g_history, final_x, final_f, final_g, constraint_display, violation_history = safe_gradient_flow_adam(
@@ -1134,13 +1158,15 @@ def main():
             beta1=args.adam_beta1,
             beta2=args.adam_beta2,
             epsilon=args.adam_epsilon,
-            verbose=True
+            verbose=True,
+            quiet=args.quiet
         )
         
         if history is None:
             return
         
         all_trajectories = [history]
+        all_violation_histories = [violation_history]
         best_trajectory = history
         best_f = final_f
         best_x = final_x
@@ -1149,9 +1175,10 @@ def main():
         best_g_history = g_history
         best_violation_history = violation_history
     
+    # Define var_names here for use in plots and export
+    var_names = [f'x{i+1}' for i in range(num_vars)]
+    
     if not args.no_plots:
-        var_names = [f'x{i+1}' for i in range(num_vars)]
-        
         if num_vars == 2:
             all_x1 = []
             all_x2 = []
@@ -1169,7 +1196,8 @@ def main():
                 x1_range = (-3, 3)
                 x2_range = (-3, 3)
             
-            print("\n[1/3] Generating 3D visualization...")
+            if not args.quiet:
+                print("\n[1/3] Generating 3D visualization...")
             ls = LossSurface(args.function, args.constraint, x1_range, x2_range, alpha=alpha)
             
             fig_3d, ax_3d = ls.plot_3d(
@@ -1181,11 +1209,13 @@ def main():
             
             if args.save:
                 fig_3d.savefig(f'{args.save}_3d.png', dpi=300, bbox_inches='tight')
-                print(f"    Saved: {args.save}_3d.png")
+                if not args.quiet:
+                    print(f"    Saved: {args.save}_3d.png")
             else:
                 plt.show()
             
-            print("\n[2/3] Generating 2D contour visualization...")
+            if not args.quiet:
+                print("\n[2/3] Generating 2D contour visualization...")
             fig_contour, ax_contour = ls.plot_contour(
                 trajectories=all_trajectories if multi_start else None,
                 best_trajectory=best_trajectory,
@@ -1195,11 +1225,13 @@ def main():
             
             if args.save:
                 fig_contour.savefig(f'{args.save}_contour.png', dpi=300, bbox_inches='tight')
-                print(f"    Saved: {args.save}_contour.png")
+                if not args.quiet:
+                    print(f"    Saved: {args.save}_contour.png")
             else:
                 plt.show()
         
-        print("\n[3/3] Generating convergence plots...")
+        if not args.quiet:
+            print("\n[3/3] Generating convergence plots...")
         fig_conv, axes_conv = plot_convergence(
             history=best_trajectory if best_trajectory else history,
             f_history=best_f_history if best_f_history else f_history,
@@ -1212,24 +1244,39 @@ def main():
         
         if args.save:
             fig_conv.savefig(f'{args.save}_convergence.png', dpi=300, bbox_inches='tight')
-            print(f"    Saved: {args.save}_convergence.png")
+            if not args.quiet:
+                print(f"    Saved: {args.save}_convergence.png")
         else:
             plt.show()
     
+    # Export trajectory data
+    if not args.quiet:
+        export_choice = input("\nWould you like to export trajectory data to CSV? (y/n, default = n): ").lower()
+        if export_choice == 'y':
+            prefix = args.save if args.save else "trajectory"
+            export_trajectory_data(
+                history=best_trajectory if best_trajectory else history,
+                f_history=best_f_history if best_f_history else f_history,
+                g_history=best_g_history if best_g_history else g_history,
+                var_names=var_names,
+                constraint_display=constraint_display,
+                prefix=prefix
+            )
+    else:
+        # In quiet mode, automatically export if --save is provided
+        if args.save:
+            prefix = args.save
+            export_trajectory_data(
+                history=best_trajectory if best_trajectory else history,
+                f_history=best_f_history if best_f_history else f_history,
+                g_history=best_g_history if best_g_history else g_history,
+                var_names=var_names,
+                constraint_display=constraint_display,
+                prefix=prefix
+            )
+    
     return best_x, best_f, best_g
 
-        # Export trajectory data
-    export_choice = input("\nWould you like to export trajectory data to CSV? (y/n, default = n): ").lower()
-    if export_choice == 'y':
-        prefix = args.save if args.save else "trajectory"
-        export_trajectory_data(
-            history=best_trajectory if best_trajectory else history,
-            f_history=best_f_history if best_f_history else f_history,
-            g_history=best_g_history if best_g_history else g_history,
-            var_names=var_names,
-            constraint_display=constraint_display,
-            prefix=prefix
-        )
 
 if __name__ == "__main__":
     try:
