@@ -507,6 +507,22 @@ Examples:
         action='store_true',
         help='Suppress iteration-by-iteration output (only show final results)'
     )
+    parser.add_argument(
+        '--kkt',
+        action='store_true',
+        help='Run KKT analysis after optimization'
+    )
+    parser.add_argument(
+        '--kkt-tolerance',
+        type=float,
+        default=1e-6,
+        help='Tolerance for KKT conditions (default: 1e-6)'
+    )
+    parser.add_argument(
+        '--kkt-export',
+        action='store_true',
+        help='Export KKT analysis to CSV files'
+    )
     return parser.parse_args()
 
 
@@ -634,51 +650,46 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
                 partial_f = math.copysign(1e6, partial_f)
             grad_f.append(partial_f)
         
-        # Compute gradient of g (the active constraint)
-        active_constraint_idx = -1
-        min_g = float('inf')
-        
-        for idx, constr in enumerate(individual_constraints):
-            try:
-                for i, val in enumerate(vals):
-                    namespace[f'x{i+1}'] = val
-                g_val = eval(constr, {"__builtins__": {}}, namespace)
-                if g_val < min_g:
-                    min_g = g_val
-                    active_constraint_idx = idx
-            except:
-                pass
-        
-        if active_constraint_idx >= 0:
-            active_constr = individual_constraints[active_constraint_idx]
-            for i in range(len(vals)):
-                vals_plus = vals.copy()
-                vals_plus[i] += h
+        # Compute gradient of active constraint (the one with smallest g value)
+        if len(individual_constraints) > 1:
+            min_g = float('inf')
+            active_idx = 0
+            for idx, constr in enumerate(individual_constraints):
                 try:
-                    for j, val in enumerate(vals_plus):
-                        namespace[f'x{j+1}'] = val
-                    g_plus = eval(active_constr, {"__builtins__": {}}, namespace)
-                    g_current_active = min_g
-                    partial_g = (g_plus - g_current_active) / h
+                    for i, val in enumerate(vals):
+                        namespace[f'x{i+1}'] = val
+                    g_val = eval(constr, {"__builtins__": {}}, namespace)
+                    if g_val < min_g:
+                        min_g = g_val
+                        active_idx = idx
                 except:
-                    partial_g = 0.0
-                
-                if np.isinf(partial_g) or np.isnan(partial_g):
-                    partial_g = 1e6 if g_plus > g_current_active else -1e6
-                if abs(partial_g) > 1e6:
-                    partial_g = math.copysign(1e6, partial_g)
-                grad_g.append(partial_g)
+                    pass
+            active_constr = individual_constraints[active_idx]
         else:
-            for i in range(len(vals)):
-                vals_plus = vals.copy()
-                vals_plus[i] += h
-                g_plus = constraint(vals_plus)
-                partial_g = (g_plus - g_current) / h
-                if np.isinf(partial_g) or np.isnan(partial_g):
-                    partial_g = 1e6 if g_plus > g_current else -1e6
-                if abs(partial_g) > 1e6:
-                    partial_g = math.copysign(1e6, partial_g)
-                grad_g.append(partial_g)
+            active_constr = individual_constraints[0]
+        
+        # Compute gradient of active constraint
+        for i in range(len(vals)):
+            vals_plus = vals.copy()
+            vals_plus[i] += h
+            try:
+                for j, val in enumerate(vals_plus):
+                    namespace[f'x{j+1}'] = val
+                g_plus = eval(active_constr, {"__builtins__": {}}, namespace)
+                
+                for j, val in enumerate(vals):
+                    namespace[f'x{j+1}'] = val
+                g_current_active = eval(active_constr, {"__builtins__": {}}, namespace)
+                
+                partial_g = (g_plus - g_current_active) / h
+            except:
+                partial_g = 0.0
+            
+            if np.isinf(partial_g) or np.isnan(partial_g):
+                partial_g = 1e6 if g_plus > g_current_active else -1e6
+            if abs(partial_g) > 1e6:
+                partial_g = math.copysign(1e6, partial_g)
+            grad_g.append(partial_g)
         
         return grad_f, grad_g, f_current, g_current
     
@@ -694,7 +705,7 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
     # Track constraint violations
     violation_count = 0
     max_violation = 0.0
-    violation_history = [0]  # Track violations per iteration for plotting
+    violation_history = [0]
     
     if g_history[0] < 0:
         violation_count += 1
@@ -728,66 +739,137 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
         t += 1
         
         grad_f, grad_g, f_val, g_val = compute_gradients(x)
-        
         grad_g_mag = math.sqrt(sum(g**2 for g in grad_g))
         
-        # If constraint is violated, move toward feasibility
+        # ============= SAFE GRADIENT FLOW UPDATE =============
+        # The safe gradient flow is:
+        # dx/dt = -∇f + (∇g/||∇g||²) * max(0, -α*g + ∇g·∇f)
+        #
+        # This naturally keeps the solution on the constraint boundary
+        # by adding a correction term when needed
+        
+        # Start with descent direction
+        descent = [-grad_f[j] for j in range(num_vars)]
+        
+        if grad_g_mag > 1e-10:
+            # Compute the dot product between ∇f and ∇g
+            dot_product = sum(grad_f[j] * grad_g[j] for j in range(num_vars))
+            
+            # The correction term: max(0, -α*g + ∇g·∇f) / ||∇g||²
+            # This pushes toward the feasible region when constraint is active
+            scalar = -alpha * g_val + dot_product
+            
+            # If scalar > 0, we need to add a correction
+            if scalar > 0:
+                # Normalize the correction
+                correction = [(grad_g[j] / (grad_g_mag ** 2)) * scalar for j in range(num_vars)]
+                update = [descent[j] + correction[j] for j in range(num_vars)]
+            else:
+                update = descent
+        else:
+            # If gradient of constraint is zero, just use descent
+            update = descent
+        
+        # ============= CONSTRAINED CORRECTION (Additional Safety) =============
+        # If constraint is violated, apply a stronger correction
+        # This ensures we never stay in the infeasible region
         if g_val < -0.001:
-            # Track violation
             violation_count += 1
             if abs(g_val) > max_violation:
                 max_violation = abs(g_val)
             
             if grad_g_mag > 1e-10:
+                # Move directly toward the feasible region
                 norm_grad_g = [grad_g[j] / grad_g_mag for j in range(num_vars)]
-                step_size = min(0.5, -g_val * 0.3)
-                update = [step_size * norm_grad_g[j] for j in range(num_vars)]
+                step_size = min(0.5, -g_val * 0.5)
+                
+                # Add the correction to the update
+                correction = [step_size * norm_grad_g[j] for j in range(num_vars)]
+                
+                # Blend correction with descent
+                blend = min(1.0, abs(g_val) * 2.0)  # More correction when more violated
+                for j in range(num_vars):
+                    update[j] = (1 - blend) * update[j] + blend * correction[j]
                 
                 if verbose and not quiet and i % 10 == 0:
-                    print(f"        Violation mode: g={g_val:.4f}, step={step_size:.4f}")
-            else:
-                update = [0.01 * random.uniform(-1, 1) for _ in range(num_vars)]
-        else:
-            descent = [-grad_f[j] for j in range(num_vars)]
-            
-            if grad_g_mag > 1e-10:
-                dot_product = sum(grad_f[j] * grad_g[j] for j in range(num_vars))
-                scalar = -alpha * g_val + dot_product
-                
-                if scalar > 0:
-                    max_correction = 1.0
-                    if scalar > max_correction:
-                        scalar = max_correction
-                    elif scalar < -max_correction:
-                        scalar = -max_correction
-                    
-                    correction = [(grad_g[j] / (grad_g_mag ** 2)) * scalar for j in range(num_vars)]
-                    update = [descent[j] + correction[j] for j in range(num_vars)]
-                else:
-                    update = descent
-            else:
-                update = descent
+                    print(f"        Constraint correction: g={g_val:.4f}, step={step_size:.4f}")
         
+        # ============= CONSTRAINT PROJECTION (Hard Enforcement) =============
+        # After the update, if constraint is still violated, project back
+        # This is a hard enforcement mechanism
+        
+        # Apply the update
+        for j in range(num_vars):
+            x[j] += current_lr * update[j]
+        
+        # Project back to feasible region if violated
+        g_new = constraint(x)
+        if g_new < -0.001:
+            # Use Newton-like projection
+            _, grad_g_proj, _, _ = compute_gradients(x)
+            grad_g_mag_proj = math.sqrt(sum(g**2 for g in grad_g_proj))
+            if grad_g_mag_proj > 1e-10:
+                norm_grad_g = [grad_g_proj[j] / grad_g_mag_proj for j in range(num_vars)]
+                # Step size to bring g back to 0
+                step_size = max(0.01, -g_new * 0.8)
+                for j in range(num_vars):
+                    x[j] += step_size * norm_grad_g[j]
+        
+        # ============= ADAM UPDATE (Only if not in violation correction mode) =============
+        # If we're not in the violation correction mode, use Adam
+        # Note: We already applied the update above, so we need to use the correct update
+        
+        # Recompute for Adam
+        grad_f, grad_g, _, g_val = compute_gradients(x)
+        grad_g_mag = math.sqrt(sum(g**2 for g in grad_g))
+        
+        # Safe gradient flow update for Adam
+        descent = [-grad_f[j] for j in range(num_vars)]
+        if grad_g_mag > 1e-10:
+            dot_product = sum(grad_f[j] * grad_g[j] for j in range(num_vars))
+            scalar = -alpha * g_val + dot_product
+            if scalar > 0:
+                correction = [(grad_g[j] / (grad_g_mag ** 2)) * scalar for j in range(num_vars)]
+                update_adam = [descent[j] + correction[j] for j in range(num_vars)]
+            else:
+                update_adam = descent
+        else:
+            update_adam = descent
+        
+        # Add noise if enabled
         if noise_amount > 0 and i > 0 and i % noise_freq == 0:
             noise = random.uniform(-noise_amount, noise_amount)
             current_lr = max(0.0000001, learning_rate + noise * learning_rate)
             if verbose and not quiet:
                 print(f"        Noise injected: LR {learning_rate:.6f} -> {current_lr:.6f}")
         
+        # Adam update
         for j in range(num_vars):
-            m[j] = beta1 * m[j] + (1 - beta1) * update[j]
-            v[j] = beta2 * v[j] + (1 - beta2) * (update[j] ** 2)
+            m[j] = beta1 * m[j] + (1 - beta1) * update_adam[j]
+            v[j] = beta2 * v[j] + (1 - beta2) * (update_adam[j] ** 2)
             
             m_hat = m[j] / (1 - beta1 ** t)
             v_hat = v[j] / (1 - beta2 ** t)
             
             step = current_lr * m_hat / (math.sqrt(v_hat) + epsilon)
             
+            # Clamp step to prevent instability
             max_step = 0.1
             if abs(step) > max_step:
                 step = math.copysign(max_step, step)
             
             x[j] = x[j] + step
+        
+        # Project back to feasible region after Adam update
+        g_new = constraint(x)
+        if g_new < -0.001:
+            _, grad_g_proj, _, _ = compute_gradients(x)
+            grad_g_mag_proj = math.sqrt(sum(g**2 for g in grad_g_proj))
+            if grad_g_mag_proj > 1e-10:
+                norm_grad_g = [grad_g_proj[j] / grad_g_mag_proj for j in range(num_vars)]
+                step_size = max(0.01, -g_new * 0.8)
+                for j in range(num_vars):
+                    x[j] += step_size * norm_grad_g[j]
         
         f_new = func(x)
         g_new = constraint(x)
@@ -836,8 +918,8 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
             row = f"{i:<6} | {x[0]:<12.6f} | {x[1]:<12.6f} | {f_str} | {g_str} | {current_lr:<10.8f}"
             print(row)
         
-        grad_magnitude = math.sqrt(sum(update[j] ** 2 for j in range(num_vars)))
-        if grad_magnitude < 1e-8 and g_new >= 0:
+        grad_magnitude = math.sqrt(sum(update_adam[j] ** 2 for j in range(num_vars)))
+        if grad_magnitude < 1e-8 and abs(g_new) < 1e-6:
             if verbose and not quiet:
                 print("-" * 70)
                 print(f"    Converged after {i+1} iterations! (gradient magnitude = {grad_magnitude:.2e})")
@@ -863,7 +945,6 @@ def safe_gradient_flow_adam(func_str, constraint_str, start_values, learning_rat
             print(f"  {name} = {x[j]:.10f}")
         print(f"  f(x) = {final_f:.16f}")
         print(f"  g(x) = {final_g:.16f} {'(SAFE)' if final_g >= 0 else '(VIOLATED)'}")
-        # Display violation statistics
         if violation_count > 0:
             print(f"  Constraint violations: {violation_count}")
             print(f"  Maximum violation: {max_violation:.6f}")
@@ -986,9 +1067,174 @@ def export_trajectory_data(history, f_history, g_history, var_names, constraint_
     print(f"    Exported metadata to: {meta_filename}")
 
 
+def kkt_analysis_main(args):
+    """Run KKT analysis on optimization results (prints results instead of showing graphs)."""
+    try:
+        from kkt_analysis import kkt_visualization, export_kkt_data, check_kkt_conditions, print_kkt_results
+        KKT_AVAILABLE = True
+    except ImportError:
+        KKT_AVAILABLE = False
+        print("Warning: kkt_analysis module not found. KKT analysis disabled.")
+        return
+    
+    if args.start:
+        start_values = [float(x.strip()) for x in args.start.split(',')]
+    else:
+        print("Error: Starting values required. Use -s")
+        return
+    
+    # Get constraint display
+    _, constraint_display = parse_constraint(args.constraint)
+    
+    # Set default learning rate and alpha if not provided
+    if args.learning_rate is None or args.alpha is None:
+        suggested_lr, suggested_alpha, reason = suggest_parameters(
+            args.function, args.constraint, start_values
+        )
+        if args.learning_rate is None:
+            learning_rate = suggested_lr
+        else:
+            learning_rate = args.learning_rate
+        if args.alpha is None:
+            alpha = suggested_alpha
+        else:
+            alpha = args.alpha
+    else:
+        learning_rate = args.learning_rate
+        alpha = args.alpha
+    
+    # Run optimization
+    print("\n" + "=" * 70)
+    print("RUNNING SAFE GRADIENT FLOW OPTIMIZATION")
+    print("=" * 70)
+    
+    history, f_history, g_history, final_x, final_f, final_g, constraint_display, violation_history = safe_gradient_flow_adam(
+        func_str=args.function,
+        constraint_str=args.constraint,
+        start_values=start_values,
+        learning_rate=learning_rate,
+        alpha=alpha,
+        max_iterations=args.iterations,
+        noise_amount=args.noise or 0,
+        noise_freq=args.noise_freq,
+        beta1=args.adam_beta1,
+        beta2=args.adam_beta2,
+        epsilon=args.adam_epsilon,
+        verbose=True,
+        quiet=args.quiet if hasattr(args, 'quiet') else False
+    )
+    
+    if history is None:
+        print("Optimization failed.")
+        return
+    
+    # Check KKT conditions
+    namespace = {
+        'sin': math.sin, 'cos': math.cos, 'tan': math.tan,
+        'exp': math.exp, 'log': math.log, 'log10': math.log10,
+        'sqrt': math.sqrt, 'pi': math.pi, 'e': math.e,
+        'abs': abs, 'min': min, 'max': max
+    }
+    for i, val in enumerate(start_values):
+        namespace[f'x{i+1}'] = val
+    
+    kkt_check = check_kkt_conditions(final_x, args.function, args.constraint, namespace, args.kkt_tolerance)
+    
+    var_names = [f'x{i+1}' for i in range(len(start_values))]
+    kkt_info = {
+        'is_kkt_satisfied': kkt_check['is_kkt_satisfied'],
+        'kkt_violation': kkt_check['kkt_violation'],
+        'details': kkt_check['details'],
+        'tolerance': args.kkt_tolerance,
+        'final_f': final_f,
+        'final_g': final_g,
+        'final_x': final_x
+    }
+    
+    # Print KKT results
+    print_kkt_results(kkt_info, var_names, args.function, args.constraint, final_x)
+    
+    # Export KKT data
+    if args.kkt_export and args.save:
+        export_kkt_data(kkt_info, var_names, args.function, args.constraint, final_x, final_f, args.save)
+    
+    # Generate standard visualizations (3D, contour, convergence) if not in no_plots mode
+    if not args.no_plots:
+        # Generate 3D visualization
+        all_x1 = [p[0] for p in history]
+        all_x2 = [p[1] for p in history]
+        x1_range = (min(all_x1) - 0.5, max(all_x1) + 0.5)
+        x2_range = (min(all_x2) - 0.5, max(all_x2) + 0.5)
+        x1_range = (min(x1_range[0], -1), max(x1_range[1], 1))
+        x2_range = (min(x2_range[0], -1), max(x2_range[1], 1))
+        
+        print("\n[1/3] Generating 3D visualization...")
+        ls = LossSurface(args.function, args.constraint, x1_range, x2_range, alpha=alpha)
+        
+        fig_3d, ax_3d = ls.plot_3d(
+            trajectories=[history],
+            best_trajectory=history,
+            title=f'Safe Gradient Flow\nf: {args.function}\n{constraint_display}',
+            alpha_val=alpha
+        )
+        
+        if args.save:
+            fig_3d.savefig(f'{args.save}_3d.png', dpi=300, bbox_inches='tight')
+            print(f"    Saved: {args.save}_3d.png")
+        else:
+            plt.figure(fig_3d.number)
+            plt.show()
+            plt.pause(0.1)
+        
+        print("\n[2/3] Generating 2D contour visualization...")
+        fig_contour, ax_contour = ls.plot_contour(
+            trajectories=[history],
+            best_trajectory=history,
+            title=f'Safe Gradient Flow - 2D View\nf: {args.function}\n{constraint_display}',
+            alpha_val=alpha
+        )
+        
+        if args.save:
+            fig_contour.savefig(f'{args.save}_contour.png', dpi=300, bbox_inches='tight')
+            print(f"    Saved: {args.save}_contour.png")
+        else:
+            plt.figure(fig_contour.number)
+            plt.show()
+            plt.pause(0.1)
+        
+        print("\n[3/3] Generating convergence plots...")
+        fig_conv, axes_conv = plot_convergence(
+            history=history,
+            f_history=f_history,
+            g_history=g_history,
+            var_names=var_names,
+            title=f'Safe Gradient Flow Convergence\nf: {args.function}',
+            alpha_val=alpha,
+            violation_history=violation_history
+        )
+        
+        if args.save:
+            fig_conv.savefig(f'{args.save}_convergence.png', dpi=300, bbox_inches='tight')
+            print(f"    Saved: {args.save}_convergence.png")
+        else:
+            plt.figure(fig_conv.number)
+            plt.show()
+            plt.pause(0.1)
+        
+        # Keep all plots open at the end
+        print("\nAll visualizations complete. Close the plot windows to exit.")
+        plt.show(block=True)
+
+
 def main():
     args = parse_arguments()
     
+    # Check for KKT analysis mode
+    if hasattr(args, 'kkt') and args.kkt:
+        kkt_analysis_main(args)
+        return
+    
+    # ... rest of your existing main() code ...
     if args.start:
         start_values = [float(x.strip()) for x in args.start.split(',')]
     else:
